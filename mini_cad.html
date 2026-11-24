@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini CAD - szkic i wyciągnięcie</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column;
+         font-family: "Segoe UI", Arial, sans-serif; background: #2b2f36; color: #e6e6e6; overflow: hidden; }
+  #top { display: flex; gap: 6px; padding: 8px; background: #1f2228; align-items: center; border-bottom: 1px solid #111; flex-wrap: wrap; }
+  #top button { background: #3a3f48; color: #eee; border: 1px solid #555; padding: 7px 12px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+  #top button:hover { background: #4a505b; }
+  #top button.active { background: #0a84ff; border-color: #0a84ff; }
+  .sep { width: 1px; height: 26px; background: #444; margin: 0 6px; }
+  #main { flex: 1; display: flex; min-height: 0; }
+  #side { width: 200px; background: #23262c; padding: 10px; overflow: auto; border-right: 1px solid #111; }
+  #side h4 { margin: 10px 0 6px; font-size: 12px; color: #9aa; text-transform: uppercase; letter-spacing: 1px; }
+  .item { padding: 6px 8px; border-radius: 4px; cursor: pointer; font-size: 14px; margin-bottom: 3px; background: #2d3139; }
+  .item:hover { background: #363c46; }
+  .item.sel { background: #0a84ff; }
+  .empty { color: #666; font-size: 12px; font-style: italic; }
+  #view { flex: 1; position: relative; min-width: 0; }
+  #view canvas { display: block; }
+  #info { position: absolute; left: 10px; bottom: 10px; background: rgba(0,0,0,.55); padding: 8px 12px; border-radius: 4px; font-size: 13px; pointer-events: none; }
+  #toast { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); background: rgba(10,132,255,.9);
+           padding: 8px 14px; border-radius: 4px; font-size: 14px; opacity: 0; transition: opacity .3s; pointer-events: none; white-space: nowrap; }
+  #panel { position: absolute; right: 12px; top: 12px; background: #23262c; padding: 14px; border-radius: 6px;
+           width: 230px; display: none; box-shadow: 0 4px 14px #0009; }
+  #panel label { font-size: 13px; color: #bbb; }
+  #pin { width: 100%; padding: 8px; margin: 8px 0; background: #15171b; color: #fff; border: 1px solid #444; border-radius: 3px; font-size: 15px; }
+  #panel .row { display: flex; gap: 6px; }
+  #panel button { flex: 1; padding: 8px; border: none; border-radius: 4px; cursor: pointer; color: #fff; }
+  #pok { background: #0a84ff; }
+  #pcancel { background: #555; }
+</style>
+</head>
+<body>
+
+<div id="top">
+  <button data-mode="select" onclick="setMode('select')">▶ Zaznacz (V)</button>
+  <button data-mode="rect" onclick="setMode('rect')">▭ Prostokąt (R)</button>
+  <button data-mode="circle" onclick="setMode('circle')">◯ Koło (C)</button>
+  <span class="sep"></span>
+  <button onclick="openExtrude()">⬆ Wyciągnij (E)</button>
+  <button onclick="deleteSelected()">🗑 Usuń (Del)</button>
+  <span class="sep"></span>
+  <button onclick="resetView()">⌂ Widok (H)</button>
+</div>
+
+<div id="main">
+  <div id="side">
+    <h4>Szkice</h4>
+    <div id="lstS"></div>
+    <h4>Bryły</h4>
+    <div id="lstB"></div>
+  </div>
+  <div id="view">
+    <div id="toast"></div>
+    <div id="info"></div>
+    <div id="panel">
+      <label id="ptitle"></label>
+      <input id="pin" type="number" min="1" step="1">
+      <div class="row">
+        <button id="pok">OK</button>
+        <button id="pcancel">Anuluj</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------- Scena ----------
+const view = document.getElementById('view');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x3a3f47);
+
+const camera = new THREE.PerspectiveCamera(45, 1, 1, 5000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+view.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+sun.position.set(100, 200, 120);
+scene.add(sun);
+scene.add(new THREE.GridHelper(400, 40, 0x777777, 0x555555)); // siatka co 10 mm
+scene.add(new THREE.AxesHelper(60));                           // osie X (czerwona), Y (zielona), Z (niebieska)
+
+const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const raycaster = new THREE.Raycaster();
+raycaster.params.Line.threshold = 3;
+const ndc = new THREE.Vector2();
+const tmp = new THREE.Vector3();
+
+// ---------- Stan ----------
+const sketches = [];   // {id, type, name, pts, line}
+const bodies = [];     // {id, name, h, sketch, mesh}
+const PALETTE = [0xe57373, 0x64b5f6, 0x81c784, 0xffb74d, 0xba68c8, 0x4db6ac, 0xf06292];
+const COL_SKETCH = 0x4fc3f7, COL_SEL = 0xffd54f;
+let mode = 'select', drawing = null, preview = null, selected = null, nextId = 1;
+let camTheta = 0.8, camPhi = 0.9, camR = 260;
+const target = new THREE.Vector3();
+const snap = v => Math.round(v / 5) * 5; // przyciąganie co 5 mm
+
+// ---------- Kamera ----------
+function updateCamera() {
+  camera.position.set(
+    target.x + camR * Math.sin(camPhi) * Math.cos(camTheta),
+    target.y + camR * Math.cos(camPhi),
+    target.z + camR * Math.sin(camPhi) * Math.sin(camTheta));
+  camera.lookAt(target);
+}
+function resetView() { camTheta = 0.8; camPhi = 0.9; camR = 260; target.set(0, 0, 0); }
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- Myszka ----------
+const el = renderer.domElement;
+let drag = null;
+el.addEventListener('contextmenu', e => e.preventDefault());
+el.addEventListener('mousedown', e => {
+  drag = { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, btn: e.button, moved: false };
+});
+el.addEventListener('wheel', e => {
+  camR = Math.min(Math.max(camR * (e.deltaY > 0 ? 1.1 : 0.9), 30), 1200);
+  e.preventDefault();
+}, { passive: false });
+
+window.addEventListener('mousemove', e => {
+  if (drag) {
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > 4) drag.moved = true;
+    if (drag.btn === 2 || (drag.btn === 0 && e.shiftKey)) {
+      // przesuwanie widoku
+      const s = camR * 0.0012;
+      const fwd = new THREE.Vector3(-Math.cos(camTheta), 0, -Math.sin(camTheta));
+      const right = new THREE.Vector3(Math.sin(camTheta), 0, -Math.cos(camTheta));
+      target.addScaledVector(right, -dx * s);
+      target.addScaledVector(fwd, -dy * s);
+    } else if (drag.btn === 1 || (drag.btn === 0 && mode === 'select' && drag.moved)) {
+      // obrót wokół modelu
+      camTheta -= dx * 0.008;
+      camPhi = Math.min(Math.max(camPhi - dy * 0.008, 0.1), Math.PI / 2 - 0.05);
+    }
+    drag.x = e.clientX; drag.y = e.clientY;
+  }
+  if (drawing) {
+    const p = groundPoint(e);
+    if (p) { drawing.b = p; refreshPreview(); updateInfo(); }
+  }
+});
+
+window.addEventListener('mouseup', e => {
+  if (drag && drag.btn === 0 && !drag.moved) onClick(e);
+  drag = null;
+});
+
+function setNdc(e) {
+  const r = el.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+}
+function groundPoint(e) {
+  setNdc(e);
+  if (!raycaster.ray.intersectPlane(groundPlane, tmp)) return null;
+  return { x: snap(tmp.x), z: snap(tmp.z) };
+}
+function pick(e) {
+  setNdc(e);
+  const objs = [...sketches.map(s => s.line), ...bodies.map(b => b.mesh)];
+  const hits = raycaster.intersectObjects(objs, false);
+  return hits.length ? hits[0].object.userData : null;
+}
+
+function onClick(e) {
+  if (mode === 'select') { select(pick(e)); return; }
+  const p = groundPoint(e);
+  if (!p) return;
+  if (!drawing) {
+    drawing = { type: mode, a: p, b: p };          // pierwszy punkt
+  } else {
+    const pts = shapePts(drawing);                  // drugi punkt - zakończ
+    if (pts) makeSketch(drawing.type, pts);
+    drawing = null;
+    renderList();
+  }
+  refreshPreview();
+  updateInfo();
+}
+
+// ---------- Szkicowanie ----------
+function shapePts(d) {
+  const { a, b } = d;
+  if (Math.abs(b.x - a.x) < 1 && Math.abs(b.z - a.z) < 1) return null;
+  if (d.type === 'rect') {
+    return [{ x: a.x, z: a.z }, { x: b.x, z: a.z }, { x: b.x, z: b.z }, { x: a.x, z: b.z }];
+  }
+  const r = Math.hypot(b.x - a.x, b.z - a.z), pts = [];
+  for (let i = 0; i < 48; i++) {
+    const t = (i / 48) * Math.PI * 2;
+    pts.push({ x: a.x + r * Math.cos(t), z: a.z + r * Math.sin(t) });
+  }
+  return pts;
+}
+
+function makeSketch(type, pts) {
+  const id = nextId++;
+  const geo = new THREE.BufferGeometry().setFromPoints(pts.map(p => new THREE.Vector3(p.x, 0.1, p.z)));
+  const line = new THREE.LineLoop(geo, new THREE.LineBasicMaterial({ color: COL_SKETCH }));
+  const s = { id, type, name: (type === 'rect' ? 'Prostokąt ' : 'Koło ') + id, pts, line };
+  line.userData = { kind: 'sketch', ref: s };
+  scene.add(line);
+  sketches.push(s);
+  return s;
+}
+
+function refreshPreview() {
+  if (preview) { scene.remove(preview); preview.geometry.dispose(); preview = null; }
+  if (!drawing) return;
+  const pts = shapePts(drawing);
+  if (!pts) return;
+  const geo = new THREE.BufferGeometry().setFromPoints(pts.map(p => new THREE.Vector3(p.x, 0.2, p.z)));
+  preview = new THREE.LineLoop(geo, new THREE.LineBasicMaterial({ color: 0xffffff }));
+  scene.add(preview);
+}
+
+// ---------- Wyciąganie ----------
+function buildGeo(sketch, h) {
+  // szkic leży w płaszczyźnie XZ; w kształcie y = -z, po obrocie wraca do właściwej pozycji
+  const shape = new THREE.Shape(sketch.pts.map(p => new THREE.Vector2(p.x, -p.z)));
+  const g = new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: false });
+  g.rotateX(-Math.PI / 2); // wyciąganie w górę (oś Y)
+  return g;
+}
+
+function createBody(sketch, h) {
+  const mesh = new THREE.Mesh(buildGeo(sketch, h),
+    new THREE.MeshStandardMaterial({ color: PALETTE[bodies.length % PALETTE.length], roughness: 0.5, metalness: 0.1 }));
+  mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry, 25),
+    new THREE.LineBasicMaterial({ color: 0x111111 })));
+  const b = { id: nextId++, name: 'Bryła ' + (bodies.length + 1), h, sketch, mesh };
+  mesh.userData = { kind: 'body', ref: b };
+  scene.add(mesh);
+  bodies.push(b);
+  return b;
+}
+
+function setBodyHeight(b, h) {
+  b.h = h;
+  const newGeo = buildGeo(b.sketch, h);
+  b.mesh.geometry.dispose();
+  b.mesh.geometry = newGeo;
+  const edges = b.mesh.children[0];
+  edges.geometry.dispose();
+  edges.geometry = new THREE.EdgesGeometry(newGeo, 25);
+  renderList();
+}
+
+// ---------- Zaznaczanie, usuwanie, tryby ----------
+function select(obj) {
+  if (selected) {
+    const r = selected.ref;
+    if (selected.kind === 'sketch') r.line.material.color.setHex(COL_SKETCH);
+    else r.mesh.material.emissive.setHex(0);
+  }
+  selected = obj;
+  if (selected) {
+    const r = selected.ref;
+    if (selected.kind === 'sketch') r.line.material.color.setHex(COL_SEL);
+    else r.mesh.material.emissive.setHex(0x335577);
+  }
+  renderList();
+  updateInfo();
+}
+
+function deleteSelected() {
+  if (!selected) return flash('Najpierw zaznacz szkic lub bryłę');
+  const r = selected.ref;
+  if (selected.kind === 'sketch') {
+    scene.remove(r.line); r.line.geometry.dispose();
+    sketches.splice(sketches.indexOf(r), 1);
+  } else {
+    scene.remove(r.mesh); r.mesh.geometry.dispose();
+    bodies.splice(bodies.indexOf(r), 1);
+  }
+  selected = null;
+  renderList();
+  updateInfo();
+}
+
+function setMode(m) {
+  mode = m;
+  drawing = null;
+  refreshPreview();
+  document.querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('active', b.dataset.mode === m));
+  closePanel();
+  updateInfo();
+}
+
+function renderList() {
+  const lS = document.getElementById('lstS'), lB = document.getElementById('lstB');
+  lS.innerHTML = ''; lB.innerHTML = '';
+  if (!sketches.length) lS.innerHTML = '<div class="empty">brak szkiców</div>';
+  if (!bodies.length) lB.innerHTML = '<div class="empty">brak brył</div>';
+  sketches.forEach(s => lS.appendChild(item(s.name, selected && selected.ref === s, () => select({ kind: 'sketch', ref: s }))));
+  bodies.forEach(b => lB.appendChild(item(`${b.name} (${b.h} mm)`, selected && selected.ref === b, () => select({ kind: 'body', ref: b }))));
+}
+function item(text, isSel, onclick) {
+  const d = document.createElement('div');
+  d.className = 'item' + (isSel ? ' sel' : '');
+  d.textContent = text;
+  d.onclick = onclick;
+  return d;
+}
+
+function updateInfo() {
+  const info = document.getElementById('info');
+  if (mode === 'select') {
+    info.textContent = 'Klik = zaznacz · przeciągnij = obróć · Shift+przeciągnij lub PPM = przesuń · kółko = zoom';
+  } else if (drawing) {
+    const w = Math.abs(drawing.b.x - drawing.a.x), h = Math.abs(drawing.b.z - drawing.a.z);
+    info.textContent = drawing.type === 'rect'
+      ? `Prostokąt ${w} × ${h} mm · kliknij, aby zakończyć (Esc = anuluj)`
+      : `Koło Ø ${Math.round(Math.hypot(w, h) * 2)} mm · kliknij, aby zakończyć (Esc = anuluj)`;
+  } else {
+    info.textContent = mode === 'rect'
+      ? 'Kliknij pierwszy róg prostokąta'
+      : 'Kliknij środek koła, potem kliknij, aby ustawić promień';
+  }
+}
+
+// ---------- Panel wartości ----------
+const panel = document.getElementById('panel');
+const pin = document.getElementById('pin');
+let panelOk = null;
+
+function openPanel(title, value, cb) {
+  document.getElementById('ptitle').textContent = title;
+  pin.value = value;
+  panelOk = cb;
+  panel.style.display = 'block';
+  pin.focus(); pin.select();
+}
+function closePanel() { panel.style.display = 'none'; panelOk = null; }
+
+function confirmPanel() {
+  const v = parseFloat(pin.value);
+  if (!(v > 0)) return flash('Podaj wartość większą od 0');
+  const cb = panelOk;
+  closePanel();
+  if (cb) cb(v);
+}
+document.getElementById('pok').onclick = confirmPanel;
+document.getElementById('pcancel').onclick = closePanel;
+pin.addEventListener('keydown', e => {
+  if (e.key === 'Enter') confirmPanel();
+  if (e.key === 'Escape') closePanel();
+});
+
+function openExtrude() {
+  if (selected && selected.kind === 'sketch') {
+    openPanel('Wyciągnij szkic - wysokość (mm)', 20, h => {
+      const b = createBody(selected.ref, h);
+      select({ kind: 'body', ref: b });
+      flash(`Wyciągnięto na ${h} mm`);
+    });
+  } else if (selected && selected.kind === 'body') {
+    openPanel('Zmień wysokość bryły (mm)', selected.ref.h, h => setBodyHeight(selected.ref, h));
+  } else {
+    flash('Najpierw zaznacz szkic (prostokąt lub koło)');
+  }
+}
+
+// ---------- Komunikaty ----------
+const toastEl = document.getElementById('toast');
+let toastT;
+function flash(t) {
+  toastEl.textContent = t;
+  toastEl.style.opacity = 1;
+  clearTimeout(toastT);
+  toastT = setTimeout(() => toastEl.style.opacity = 0, 2500);
+}
+
+// ---------- Klawiatura ----------
+window.addEventListener('keydown', e => {
+  if (document.activeElement === pin) return;
+  const k = e.key.toLowerCase();
+  if (k === 'r') setMode('rect');
+  else if (k === 'c') setMode('circle');
+  else if (k === 'v') setMode('select');
+  else if (k === 'e') openExtrude();
+  else if (k === 'h') resetView();
+  else if (e.key === 'Delete' || e.key === 'Backspace') deleteSelected();
+  else if (e.key === 'Escape') {
+    if (drawing) { drawing = null; refreshPreview(); updateInfo(); }
+    else { closePanel(); select(null); }
+  }
+});
+
+// ---------- Pętla ----------
+function loop() {
+  requestAnimationFrame(loop);
+  updateCamera();
+  renderer.render(scene, camera);
+}
+setMode('select');
+renderList();
+loop();
+</script>
+</body>
+</html>
